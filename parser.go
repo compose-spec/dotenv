@@ -47,11 +47,13 @@ func unescapeDoubleQuoted(s string) string {
 // Parse reads an .env file from the provided reader and returns a parsed EnvFile
 func Parse(ctx context.Context, reader io.Reader) (*EnvFile, error) {
 	envFile := &EnvFile{
-		variables: []Variable{},
+		Variables: []Variable{},
 	}
 
 	scanner := bufio.NewScanner(reader)
 	lineNumber := 0
+	// Track defined variable names
+	definedVars := make(map[string]bool)
 
 	for scanner.Scan() {
 		lineNumber++
@@ -64,6 +66,7 @@ func Parse(ctx context.Context, reader io.Reader) (*EnvFile, error) {
 		}
 
 		line := scanner.Text()
+		originalLine := line
 
 		// Skip empty lines and comments
 		if line == "" || strings.HasPrefix(line, "#") {
@@ -71,7 +74,8 @@ func Parse(ctx context.Context, reader io.Reader) (*EnvFile, error) {
 		}
 
 		// Remove 'export ' prefix if present
-		if strings.HasPrefix(line, "export ") {
+		isExportLine := strings.HasPrefix(line, "export ")
+		if isExportLine {
 			line = line[7:]
 		}
 
@@ -81,8 +85,17 @@ func Parse(ctx context.Context, reader io.Reader) (*EnvFile, error) {
 
 		var separatorIdx int
 		if equalIdx == -1 && colonIdx == -1 {
-			// No separator found, skip line
-			continue
+			// No separator found
+			// Allow "export VARIABLE" if VARIABLE is already defined
+			if isExportLine {
+				varName := strings.TrimSpace(line)
+				if definedVars[varName] {
+					// Valid export of existing variable, skip line
+					continue
+				}
+				return nil, fmt.Errorf("line %d %q has an unset variable", lineNumber, varName)
+			}
+			return nil, fmt.Errorf("line %d: no separator found in line: %s", lineNumber, originalLine)
 		} else if equalIdx == -1 {
 			separatorIdx = colonIdx
 		} else if colonIdx == -1 {
@@ -100,181 +113,115 @@ func Parse(ctx context.Context, reader io.Reader) (*EnvFile, error) {
 		name := strings.TrimSpace(line[:separatorIdx])
 		value := strings.TrimSpace(line[separatorIdx+1:])
 
-		// Remove surrounding quotes if present
+		// Validate variable name - must match [A-Za-z0-9_.-]
+		if !isValidVariableName(name) {
+			return nil, fmt.Errorf("line %d: invalid variable name %q", lineNumber, name)
+		}
+
+		// Handle inline comments: strip # comment from unquoted values
+		// But preserve # in quoted values
+		quoteStyle := Unquoted
+		if len(value) > 0 && value[0] != '"' && value[0] != '\'' {
+			// Unquoted value: look for # comment marker
+			if commentIdx := strings.Index(value, "#"); commentIdx != -1 {
+				value = strings.TrimSpace(value[:commentIdx])
+			}
+		}
+
+		// Handle multi-line quoted values
+		if len(value) > 0 && (value[0] == '"' || value[0] == '\'') {
+			quoteChar := value[0]
+			// Check if quote is closed on the same line
+			closingQuoteIdx := -1
+			for i := 1; i < len(value); i++ {
+				if value[i] == quoteChar {
+					// Check if it's escaped (for double quotes)
+					if quoteChar == '"' && i > 0 && value[i-1] == '\\' {
+						continue
+					}
+					closingQuoteIdx = i
+					break
+				}
+			}
+
+			// If quote is not closed, read more lines
+			if closingQuoteIdx == -1 {
+				var multilineValue strings.Builder
+				multilineValue.WriteString(value)
+
+				for scanner.Scan() {
+					lineNumber++
+					nextLine := scanner.Text()
+					multilineValue.WriteString("\n")
+					multilineValue.WriteString(nextLine)
+
+					// Look for closing quote in this line
+					for i := 0; i < len(nextLine); i++ {
+						if nextLine[i] == quoteChar {
+							// Check if it's escaped (for double quotes)
+							if quoteChar == '"' && i > 0 && nextLine[i-1] == '\\' {
+								continue
+							}
+							closingQuoteIdx = i
+							break
+						}
+					}
+
+					if closingQuoteIdx != -1 {
+						break
+					}
+				}
+
+				value = multilineValue.String()
+			}
+		}
+
+		// Track quote style and remove surrounding quotes if present
 		if len(value) >= 2 {
 			if value[0] == '"' && value[len(value)-1] == '"' {
 				// Double-quoted: remove quotes and process escape sequences
+				quoteStyle = DoubleQuoted
 				value = unescapeDoubleQuoted(value[1 : len(value)-1])
 			} else if value[0] == '\'' && value[len(value)-1] == '\'' {
 				// Single-quoted: just remove quotes, no escape processing
+				quoteStyle = Quoted
 				value = value[1 : len(value)-1]
 			}
 		}
 
 		variable := Variable{
 			Name:     name,
-			Value:    value,
 			RawValue: value,
 			Location: Location(fmt.Sprintf(":%d", lineNumber)),
+			Quoted:   quoteStyle,
 			Expanded: make(map[string]Location),
 		}
 
-		envFile.variables = append(envFile.variables, variable)
+		envFile.Variables = append(envFile.Variables, variable)
+		definedVars[name] = true
 	}
 
 	if err := scanner.Err(); err != nil {
 		return nil, err
 	}
 
-	// Perform variable expansion
-	if err := expand(envFile); err != nil {
-		return nil, err
-	}
-
 	return envFile, nil
 }
 
-// expand processes variable expansion in the EnvFile
-// It replaces $VARIABLE and ${VARIABLE} references with values from previously declared variables
-func expand(envFile *EnvFile) error {
-	// Build a map of variables as we go for lookups
-	varMap := make(map[string]string)
-	locMap := make(map[string]Location)
-
-	for i := range envFile.variables {
-		// Track which variables are expanded
-		expanded := make(map[string]Location)
-
-		// Expand the current variable's value using previously declared variables
-		val, err := expandValue(envFile.variables[i].Value, varMap, locMap, expanded)
-		if err != nil {
-			return err
-		}
-		envFile.variables[i].Value = val
-		envFile.variables[i].Expanded = expanded
-
-		// Add the current variable to the map for future expansions
-		varMap[envFile.variables[i].Name] = envFile.variables[i].Value
-		locMap[envFile.variables[i].Name] = envFile.variables[i].Location
+// isValidVariableName returns true if the variable name matches [A-Za-z0-9_.-] and doesn't start with a digit
+func isValidVariableName(name string) bool {
+	if len(name) == 0 {
+		return false
 	}
-	return nil
-}
-
-// expandValue replaces $VAR and ${VAR} references in the value
-func expandValue(value string, varMap map[string]string, locMap map[string]Location, expanded map[string]Location) (string, error) {
-	var result strings.Builder
-	result.Grow(len(value))
-
-	for i := 0; i < len(value); i++ {
-		if value[i] == '$' && i+1 < len(value) {
-			if value[i+1] == '{' {
-				// ${VARIABLE} syntax with possible default/replacement value
-				endIdx := strings.Index(value[i+2:], "}")
-				if endIdx != -1 {
-					content := value[i+2 : i+2+endIdx]
-
-					// Check for ${VAR:?error} (error if unset or empty)
-					if colonQuestionIdx := strings.Index(content, ":?"); colonQuestionIdx != -1 {
-						varName := content[:colonQuestionIdx]
-						errorMsg := content[colonQuestionIdx+2:]
-						val, ok := varMap[varName]
-						if !ok || val == "" {
-							if errorMsg == "" {
-								return "", fmt.Errorf("%s: required variable is not set", varName)
-							}
-							return "", fmt.Errorf("%s", errorMsg)
-						}
-						result.WriteString(val)
-						expanded[varName] = locMap[varName]
-					} else if colonDashIdx := strings.Index(content, ":-"); colonDashIdx != -1 {
-						// Check for ${VAR:-default} (use default if unset or empty)
-						varName := content[:colonDashIdx]
-						defaultValue := content[colonDashIdx+2:]
-						if val, ok := varMap[varName]; ok && val != "" {
-							result.WriteString(val)
-							expanded[varName] = locMap[varName]
-						} else {
-							result.WriteString(defaultValue)
-						}
-					} else if colonPlusIdx := strings.Index(content, ":+"); colonPlusIdx != -1 {
-						// Check for ${VAR:+replacement} (use replacement if set and non-empty)
-						varName := content[:colonPlusIdx]
-						replacement := content[colonPlusIdx+2:]
-						if val, ok := varMap[varName]; ok && val != "" {
-							result.WriteString(replacement)
-							expanded[varName] = locMap[varName]
-						}
-						// Otherwise leave empty
-					} else if questionIdx := strings.Index(content, "?"); questionIdx != -1 {
-						// Check for ${VAR?error} (error if unset, but can be empty)
-						varName := content[:questionIdx]
-						errorMsg := content[questionIdx+1:]
-						if _, ok := varMap[varName]; !ok {
-							if errorMsg == "" {
-								return "", fmt.Errorf("%s: required variable is not set", varName)
-							}
-							return "", fmt.Errorf("%s", errorMsg)
-						}
-						result.WriteString(varMap[varName])
-						expanded[varName] = locMap[varName]
-					} else if dashIdx := strings.Index(content, "-"); dashIdx != -1 {
-						// Check for ${VAR-default} (use default if unset)
-						varName := content[:dashIdx]
-						defaultValue := content[dashIdx+1:]
-						if val, ok := varMap[varName]; ok {
-							result.WriteString(val)
-							expanded[varName] = locMap[varName]
-						} else {
-							result.WriteString(defaultValue)
-						}
-					} else if plusIdx := strings.Index(content, "+"); plusIdx != -1 {
-						// Check for ${VAR+replacement} (use replacement if set)
-						varName := content[:plusIdx]
-						replacement := content[plusIdx+1:]
-						if _, ok := varMap[varName]; ok {
-							result.WriteString(replacement)
-							expanded[varName] = locMap[varName]
-						}
-						// Otherwise leave empty
-					} else {
-						// Simple ${VAR} syntax
-						if val, ok := varMap[content]; ok {
-							result.WriteString(val)
-							expanded[content] = locMap[content]
-						}
-						// If variable not found, leave it empty (standard behavior)
-					}
-					i = i + 2 + endIdx // skip past the }
-				} else {
-					// No closing brace, write literal
-					result.WriteByte(value[i])
-				}
-			} else if isVarNameChar(value[i+1]) {
-				// $VARIABLE syntax
-				j := i + 1
-				for j < len(value) && isVarNameChar(value[j]) {
-					j++
-				}
-				varName := value[i+1 : j]
-				if val, ok := varMap[varName]; ok {
-					result.WriteString(val)
-					expanded[varName] = locMap[varName]
-				}
-				// If variable not found, leave it empty
-				i = j - 1 // will be incremented by loop
-			} else {
-				// $ followed by non-variable char, write literal
-				result.WriteByte(value[i])
-			}
-		} else {
-			result.WriteByte(value[i])
+	// First character cannot be a digit
+	if name[0] >= '0' && name[0] <= '9' {
+		return false
+	}
+	for i := 0; i < len(name); i++ {
+		c := name[i]
+		if !((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_' || c == '.' || c == '-') {
+			return false
 		}
 	}
-
-	return result.String(), nil
-}
-
-// isVarNameChar returns true if the character is valid in a variable name
-func isVarNameChar(c byte) bool {
-	return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_'
+	return true
 }
