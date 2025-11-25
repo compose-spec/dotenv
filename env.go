@@ -17,16 +17,6 @@ const (
 	DoubleQuoted
 )
 
-// Variable represents a single environment variable with its metadata
-type Variable struct {
-	Name     string
-	Value    string
-	RawValue string
-	Location Location
-	Quoted   QuoteStyle
-	Expanded map[string]Location // tracks which variables were expanded and where they came from
-}
-
 // EnvFile represents a parsed .env file containing a list of variables
 type EnvFile struct {
 	Variables []Variable
@@ -116,7 +106,7 @@ func findOperator(content string, operator string) int {
 }
 
 // expandString expands variable references in a string value
-func expandString(value string, lookup func(string) (Variable, bool)) (string, map[string]Location, error) {
+func expandString(value string, lookup LookupFn) (string, map[string]Location, error) {
 	expanded := make(map[string]Location)
 	var result strings.Builder
 	result.Grow(len(value))
@@ -274,17 +264,6 @@ func expandString(value string, lookup func(string) (Variable, bool)) (string, m
 	}
 
 	return result.String(), expanded, nil
-}
-
-// expandValue replaces $VAR and ${VAR} references in the value
-func (v *Variable) expandValue(lookup func(string) (Variable, bool)) error {
-	val, exp, err := expandString(v.RawValue, lookup)
-	if err != nil {
-		return err
-	}
-	v.Value = val
-	v.Expanded = exp
-	return nil
 }
 
 // isVarNameChar returns true if the character is valid in a variable name
