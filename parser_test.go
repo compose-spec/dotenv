@@ -663,13 +663,13 @@ func TestParse(t *testing.T) {
 			env, err := dotenv.Parse(context.TODO(), strings.NewReader(test.input))
 			if test.err == "" {
 				assert.NilError(t, err)
-				vars, err := env.Resolve()
+				vars, err := env.Resolve(nil)
 				assert.NilError(t, err)
 				assert.DeepEqual(t, test.expect, vars)
 			} else if strings.Contains(test.err, "required") {
 				// Error expected from Resolve() for required variable checks
 				assert.NilError(t, err)
-				_, err = env.Resolve()
+				_, err = env.Resolve(nil)
 				assert.Error(t, err, test.err)
 			} else {
 				// Error expected from Parse()

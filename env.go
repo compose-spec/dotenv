@@ -24,9 +24,10 @@ type EnvFile struct {
 }
 
 // Resolve performs variable expansion and returns the environment variables as a map[string]string
-func (e *EnvFile) Resolve() (map[string]string, error) {
+// An optional lookup function can be provided for resolving variables not defined in the file
+func (e *EnvFile) Resolve(externalLookup LookupFn) (map[string]string, error) {
 	if !e.expanded {
-		if err := e.expand(); err != nil {
+		if err := e.expand(externalLookup); err != nil {
 			return nil, err
 		}
 		e.expanded = true
@@ -41,7 +42,8 @@ func (e *EnvFile) Resolve() (map[string]string, error) {
 
 // expand processes variable expansion in the EnvFile
 // It replaces $VARIABLE and ${VARIABLE} references with values from previously declared variables
-func (e *EnvFile) expand() error {
+// and optionally from an additional lookup function
+func (e *EnvFile) expand(externalLookup LookupFn) error {
 	// Build a map of variables as we go for lookups
 	vars := make(map[string]Variable)
 
@@ -54,11 +56,27 @@ func (e *EnvFile) expand() error {
 			continue
 		}
 
-		// Expand the current variable's value using previously declared variables
-		lookup := func(name string) (Variable, bool) {
+		// Create a composite lookup that checks internal vars first, then external lookup
+		internalLookup := func(name string) (Variable, bool) {
 			v, ok := vars[name]
 			return v, ok
 		}
+
+		var lookup LookupFn
+		if externalLookup != nil {
+			// Create composite with internal lookup having highest priority
+			lookup = func(name string) (Variable, bool) {
+				// Try internal lookup first
+				if v, ok := internalLookup(name); ok {
+					return v, true
+				}
+				// Try external lookup
+				return externalLookup(name)
+			}
+		} else {
+			lookup = internalLookup
+		}
+
 		if err := e.Variables[i].expandValue(lookup); err != nil {
 			return err
 		}
